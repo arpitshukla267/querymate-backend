@@ -65,6 +65,16 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model("User", userSchema);
 
+// ContextSession Schema
+const contextSessionSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  collectedData: { type: Object, default: {} },
+  stage: { type: String, enum: ["collecting", "complete"], default: "collecting" },
+  lastUpdated: { type: Date, default: Date.now }
+});
+
+const ContextSession = mongoose.model("ContextSession", contextSessionSchema);
+
 // JWT secret
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key-change-in-production";
 
@@ -231,6 +241,342 @@ app.get("/api/user/context", authenticateToken, async (req, res) => {
   }
 });
 
+// Get or initialize context session
+app.get("/api/context-session", authenticateToken, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    let session = await ContextSession.findOne({ email: req.user.email });
+    const isNewSession = !session && !req.user.contextData;
+    
+    // If no session exists and user has no contextData, create new session
+    if (isNewSession) {
+      session = new ContextSession({
+        email: req.user.email,
+        collectedData: {},
+        stage: "collecting"
+      });
+      await session.save();
+      
+      // Get initial greeting from Gemini
+      const geminiApiKey = process.env.GEMINI_API_KEY;
+      if (geminiApiKey) {
+        try {
+          const tempGenAI = new GoogleGenerativeAI(geminiApiKey);
+          const prompt = `You are QueryMate, an intelligent assistant that gathers detailed context information about a business or service.
+
+Your task is to ask smart, natural questions until you have enough information to generate a complete description.
+
+Use what you already know to decide the next question — do not ask irrelevant or repetitive things.
+
+Always collect details such as:
+- What the business or service offers
+- Target users or customers
+- Core features or benefits
+- Pricing or availability details
+- Contact or support information
+- Any additional unique qualities
+
+Once you have enough context, mark the process as complete.
+
+Respond in JSON format only:
+
+{
+  "reply": "<your next conversational question or confirmation>",
+  "collectedData": {
+    "business_name": "...",
+    "description": "...",
+    "target_audience": "...",
+    "features": "...",
+    "pricing": "...",
+    "support": "...",
+    "contact": "...",
+    "...": "add dynamically as discovered"
+  },
+  "done": true or false
+}
+
+Current collected data:
+{}
+
+Latest user message:
+"[Initial greeting - start the conversation]"`;
+
+          const modelsToTry = ["gemini-1.5-pro", "gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-pro"];
+          for (const modelName of modelsToTry) {
+            try {
+              const model = tempGenAI.getGenerativeModel({ model: modelName });
+              const result = await model.generateContent(prompt);
+              const response = await result.response;
+              const text = response.text();
+              
+              let jsonText = text.trim();
+              if (jsonText.startsWith("```")) {
+                jsonText = jsonText.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+              }
+              
+              const geminiResponse = JSON.parse(jsonText);
+              if (geminiResponse.collectedData) {
+                session.collectedData = { ...session.collectedData, ...geminiResponse.collectedData };
+              }
+              if (geminiResponse.done === true) {
+                session.stage = "complete";
+              }
+              session.lastUpdated = new Date();
+              await session.save();
+              
+              return res.json({
+                session: {
+                  collectedData: session.collectedData,
+                  stage: session.stage,
+                  lastUpdated: session.lastUpdated
+                },
+                initialMessage: geminiResponse.reply || "Hello! I'm QueryMate. Let's gather some information about your business or service. What does your business do?"
+              });
+            } catch (err) {
+              continue;
+            }
+          }
+        } catch (err) {
+          console.error("Error getting initial greeting:", err);
+        }
+      }
+      
+      // Fallback if Gemini fails
+      return res.json({
+        session: {
+          collectedData: session.collectedData,
+          stage: session.stage,
+          lastUpdated: session.lastUpdated
+        },
+        initialMessage: "Hello! I'm QueryMate. Let's gather some information about your business or service. What does your business do?"
+      });
+    }
+
+    // If session exists but is complete, return it
+    if (session) {
+      return res.json({
+        session: {
+          collectedData: session.collectedData,
+          stage: session.stage,
+          lastUpdated: session.lastUpdated
+        }
+      });
+    }
+
+    // If user already has contextData, return that they're done
+    res.json({
+      session: {
+        collectedData: {},
+        stage: "complete",
+        hasExistingContext: true
+      }
+    });
+  } catch (err) {
+    console.error("Get context session error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send message to context collection conversation
+app.post("/api/context-session/message", authenticateToken, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { message } = req.body;
+    if (!message) {
+      return res.status(400).json({ error: "Message is required" });
+    }
+
+    const geminiApiKey = process.env.GEMINI_API_KEY;
+    if (!geminiApiKey) {
+      return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
+    }
+
+    // Get or create session
+    let session = await ContextSession.findOne({ email: req.user.email });
+    if (!session) {
+      session = new ContextSession({
+        email: req.user.email,
+        collectedData: {},
+        stage: "collecting"
+      });
+    }
+
+    if (session.stage === "complete") {
+      return res.status(400).json({ error: "Context collection is already complete" });
+    }
+
+    // Build Gemini prompt
+    const prompt = `You are QueryMate, an intelligent assistant that gathers detailed context information about a business or service.
+
+Your task is to ask smart, natural questions until you have enough information to generate a complete description.
+
+Use what you already know to decide the next question — do not ask irrelevant or repetitive things.
+
+Always collect details such as:
+- What the business or service offers
+- Target users or customers
+- Core features or benefits
+- Pricing or availability details
+- Contact or support information
+- Any additional unique qualities
+
+Once you have enough context, mark the process as complete.
+
+Respond in JSON format only:
+
+{
+  "reply": "<your next conversational question or confirmation>",
+  "collectedData": {
+    "business_name": "...",
+    "description": "...",
+    "target_audience": "...",
+    "features": "...",
+    "pricing": "...",
+    "support": "...",
+    "contact": "...",
+    "...": "add dynamically as discovered"
+  },
+  "done": true or false
+}
+
+Current collected data:
+${JSON.stringify(session.collectedData, null, 2)}
+
+Latest user message:
+"${message}"`;
+
+    // Call Gemini API
+    const tempGenAI = new GoogleGenerativeAI(geminiApiKey);
+    const modelsToTry = ["gemini-1.5-pro", "gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-pro"];
+    let lastError = null;
+    let geminiResponse = null;
+
+    for (const modelName of modelsToTry) {
+      try {
+        const model = tempGenAI.getGenerativeModel({ model: modelName });
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text();
+        
+        // Try to parse JSON from response
+        // Sometimes Gemini wraps JSON in markdown code blocks
+        let jsonText = text.trim();
+        if (jsonText.startsWith("```")) {
+          jsonText = jsonText.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+        }
+        
+        geminiResponse = JSON.parse(jsonText);
+        break;
+      } catch (err) {
+        lastError = err;
+        console.log(`Model ${modelName} failed, trying next...`);
+        continue;
+      }
+    }
+
+    if (!geminiResponse) {
+      throw lastError || new Error("All models failed");
+    }
+
+    // Merge collected data
+    if (geminiResponse.collectedData) {
+      session.collectedData = { ...session.collectedData, ...geminiResponse.collectedData };
+    }
+
+    // Update stage if done
+    if (geminiResponse.done === true) {
+      session.stage = "complete";
+    }
+
+    session.lastUpdated = new Date();
+    await session.save();
+
+    res.json({
+      reply: geminiResponse.reply || "Thank you for the information!",
+      collectedData: session.collectedData,
+      done: geminiResponse.done || false
+    });
+  } catch (err) {
+    console.error("Context session message error:", err);
+    res.status(500).json({ error: err.message || "Failed to process message" });
+  }
+});
+
+// Complete context session and save to User contextData
+app.post("/api/context-session/complete", authenticateToken, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { finalContext } = req.body;
+    
+    // Get session
+    const session = await ContextSession.findOne({ email: req.user.email });
+    if (!session || session.stage !== "complete") {
+      return res.status(400).json({ error: "Session not found or not complete" });
+    }
+
+    // Update user's contextData
+    const user = await User.findById(req.user._id);
+    // Use provided finalContext if available, otherwise format collectedData as readable text
+    if (finalContext) {
+      user.contextData = finalContext;
+    } else {
+      // Format collectedData into a readable context summary
+      const data = session.collectedData;
+      let formattedContext = "";
+      
+      if (data.business_name) {
+        formattedContext += `Business Name: ${data.business_name}\n\n`;
+      }
+      if (data.description) {
+        formattedContext += `Description:\n${data.description}\n\n`;
+      }
+      if (data.target_audience) {
+        formattedContext += `Target Audience: ${data.target_audience}\n\n`;
+      }
+      if (data.features) {
+        formattedContext += `Features:\n${data.features}\n\n`;
+      }
+      if (data.pricing) {
+        formattedContext += `Pricing: ${data.pricing}\n\n`;
+      }
+      if (data.support) {
+        formattedContext += `Support: ${data.support}\n\n`;
+      }
+      if (data.contact) {
+        formattedContext += `Contact: ${data.contact}\n\n`;
+      }
+      
+      // Add any additional fields
+      Object.keys(data).forEach(key => {
+        if (!["business_name", "description", "target_audience", "features", "pricing", "support", "contact"].includes(key)) {
+          formattedContext += `${key}: ${data[key]}\n\n`;
+        }
+      });
+      
+      user.contextData = formattedContext.trim() || JSON.stringify(session.collectedData, null, 2);
+    }
+    
+    await user.save();
+
+    res.json({ 
+      message: "Context data saved successfully!",
+      contextData: user.contextData
+    });
+  } catch (err) {
+    console.error("Complete context session error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Gemini setup
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) console.warn("⚠️ Missing GEMINI_API_KEY in .env");
@@ -287,7 +633,7 @@ app.post("/api/chat/public", authenticateApiKey, async (req, res) => {
       return res.status(401).json({ error: "Invalid API key" });
     }
 
-    const prompt = `You are QueryMate, a helpful assistant. Use ONLY the following context to answer. If the answer isn't in the context, say "I am here to discuss the information you've provided. Could you tell me more about what you're looking for?"\n\nContext:\n${contextToUse}\n\nUser question:\n${message}`;
+    const prompt = `You are QueryMate, a helpful assistant. Use ONLY the following context to answer. If the answer isn't in the context, say "Hmm, that doesn’t seem related to what I can help with. Want to try a different question?"\n\nContext:\n${contextToUse}\n\nUser question:\n${message}`;
 
     // Try models in order: gemini-2.0-flash-exp, gemini-1.5-flash, gemini-pro
     const modelsToTry = ["gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-pro"];
