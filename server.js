@@ -19,13 +19,34 @@ const allowedOrigins = [
   process.env.FRONTEND_URL
 ].filter(Boolean);
 
-app.use(cors({
-  origin: allowedOrigins.length > 0 ? allowedOrigins : true,
-  methods: ["GET", "POST", "PATCH", "PUT", "DELETE"],
-  credentials: true
-}));
+// CORS for regular endpoints
+app.use((req, res, next) => {
+  // Allow all origins for public chat endpoint (widget embedding)
+  if (req.path === "/api/chat/public" || req.path === "/widget.js") {
+    res.header("Access-Control-Allow-Origin", "*");
+    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(200);
+    }
+  } else {
+    // Use standard CORS for other endpoints
+    const origin = req.headers.origin;
+    if (allowedOrigins.includes(origin) || !origin) {
+      res.header("Access-Control-Allow-Origin", origin || "*");
+    }
+    res.header("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.header("Access-Control-Allow-Credentials", "true");
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(200);
+    }
+  }
+  next();
+});
 
 app.use(express.json());
+app.use(express.static("public")); // Serve static files from public directory
 
 // MongoDB connection
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://shuklaarpit440:xwvcF71gxIKRzQJf@cluster0.tduy54y.mongodb.net/chatbot";
@@ -38,6 +59,7 @@ const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
   contextData: { type: String, default: "" }, // User-specific context for chatbot
+  apiKey: { type: String, unique: true, sparse: true }, // API key for widget embedding
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -66,6 +88,18 @@ const authenticateToken = async (req, res, next) => {
 
 app.get("/", (req, res) => {
   res.send("Backend is running ✅");
+});
+
+// Serve widget.js file
+app.get("/widget.js", (req, res) => {
+  res.setHeader("Content-Type", "application/javascript");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  const widgetPath = path.join(__dirname, "public", "widget.js");
+  if (fs.existsSync(widgetPath)) {
+    res.sendFile(widgetPath);
+  } else {
+    res.status(404).send("Widget file not found");
+  }
 });
 
 // Register endpoint
@@ -126,13 +160,54 @@ app.post("/api/user/context", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
+    const user = await User.findById(req.user._id);
     const { contextData } = req.body;
-    req.user.contextData = contextData || "";
-    await req.user.save();
+    user.contextData = contextData || "";
+    await user.save();
 
     res.json({ message: "Context data updated successfully" });
   } catch (err) {
     console.error("Context update error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Generate or regenerate API key
+app.post("/api/user/api-key", authenticateToken, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const user = await User.findById(req.user._id);
+    // Generate a secure API key with email for uniqueness
+    const crypto = await import("crypto");
+    // Create a hash of email for uniqueness, then add random bytes
+    const emailHash = crypto.createHash("md5").update(user.email).digest("hex").substring(0, 8);
+    const randomBytes = crypto.randomBytes(24).toString("hex");
+    const newApiKey = `qm_${emailHash}_${randomBytes}`;
+    
+    user.apiKey = newApiKey;
+    await user.save();
+
+    res.json({ apiKey: newApiKey, message: "API key generated successfully" });
+  } catch (err) {
+    console.error("API key generation error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get API key (without regenerating)
+app.get("/api/user/api-key", authenticateToken, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const user = await User.findById(req.user._id).select("apiKey");
+    res.json({ apiKey: user.apiKey || null });
+  } catch (err) {
+    console.error("Get API key error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -144,7 +219,12 @@ app.get("/api/user/context", authenticateToken, async (req, res) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    res.json({ contextData: req.user.contextData || "" });
+    // Fetch fresh user data to get latest contextData and apiKey
+    const user = await User.findById(req.user._id).select("-password");
+    res.json({ 
+      contextData: user.contextData || "",
+      apiKey: user.apiKey || null
+    });
   } catch (err) {
     console.error("Get context error:", err);
     res.status(500).json({ error: err.message });
@@ -173,7 +253,69 @@ try {
   console.warn("⚠️ Failed to load domain data:", e.message);
 }
 
-// Chat route with user context support
+// Middleware to authenticate by API key
+const authenticateApiKey = async (req, res, next) => {
+  const userApiKey = req.headers["x-api-key"] || req.body.apiKey;
+  
+  if (!userApiKey) {
+    return next(); // Continue without user if no API key
+  }
+
+  try {
+    const user = await User.findOne({ apiKey: userApiKey }).select("-password");
+    if (user) {
+      req.user = user;
+    }
+    next();
+  } catch (err) {
+    next(); // Continue without user if error
+  }
+};
+
+// Public chat endpoint for widget (uses API key)
+app.post("/api/chat/public", authenticateApiKey, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ error: "Message is required" });
+    if (!apiKey) return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
+
+    // Use user context if API key is valid, otherwise use default
+    let contextToUse = defaultDomainContext;
+    if (req.user && req.user.contextData) {
+      contextToUse = req.user.contextData;
+    } else if (!req.user) {
+      return res.status(401).json({ error: "Invalid API key" });
+    }
+
+    const prompt = `You are QueryMate, a helpful assistant. Use ONLY the following context to answer. If the answer isn't in the context, say "I am here to discuss the information you've provided. Could you tell me more about what you're looking for?"\n\nContext:\n${contextToUse}\n\nUser question:\n${message}`;
+
+    // Try models in order: gemini-2.0-flash-exp, gemini-1.5-flash, gemini-pro
+    const modelsToTry = ["gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-pro"];
+    let lastError = null;
+
+    for (const modelName of modelsToTry) {
+      try {
+        const model = genAI.getGenerativeModel({ model: modelName });
+        const result = await model.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text();
+        return res.json({ reply: text });
+      } catch (err) {
+        lastError = err;
+        console.log(`Model ${modelName} failed, trying next...`);
+        continue;
+      }
+    }
+
+    // If all models failed, return error
+    throw lastError || new Error("All models failed");
+  } catch (err) {
+    console.error("ERROR in /api/chat/public:", err);
+    res.status(500).json({ error: err.message || "Failed to process request" });
+  }
+});
+
+// Chat route with user context support (for authenticated users)
 app.post("/api/chat", authenticateToken, async (req, res) => {
   try {
     const { message } = req.body;
