@@ -269,7 +269,6 @@ app.get("/api/widget-settings", authenticateApiKey, async (req, res) => {
           chatWindowColor: "#ffffff",
           headerColor: "#667eea",
           headerText: "QueryMate",
-          poweredByText: "Powered by QueryMate"
         }
       });
     }
@@ -282,7 +281,6 @@ app.get("/api/widget-settings", authenticateApiKey, async (req, res) => {
         chatWindowColor: "#ffffff",
         headerColor: "#667eea",
         headerText: "QueryMate",
-        poweredByText: "Powered by QueryMate"
       }
     });
   } catch (err) {
@@ -295,7 +293,6 @@ app.get("/api/widget-settings", authenticateApiKey, async (req, res) => {
         chatWindowColor: "#ffffff",
         headerColor: "#667eea",
         headerText: "QueryMate",
-        poweredByText: "Powered by QueryMate"
       }
     });
   }
@@ -326,7 +323,6 @@ app.get("/api/user/widget-settings", authenticateToken, async (req, res) => {
         chatWindowColor: "#ffffff",
         headerColor: "#667eea",
         headerText: "QueryMate",
-        poweredByText: "Powered by QueryMate"
       }
     });
   } catch (err) {
@@ -726,25 +722,62 @@ try {
   console.warn("⚠️ Failed to load domain data:", e.message);
 }
 
+// Load local Q&A data for KnectHotel
+const knectQAPath = path.join(__dirname, "data", "knect_data.json");
+let knectQA = [];
+
+try {
+  if (fs.existsSync(knectQAPath)) {
+    knectQA = JSON.parse(fs.readFileSync(knectQAPath, "utf-8"));
+    console.log(`✅ Loaded ${knectQA.length} KnectHotel Q&A entries`);
+  } else {
+    console.warn(`⚠️ Missing ${knectQAPath}`);
+  }
+} catch (err) {
+  console.error("❌ Failed to load knect_data.json:", err);
+}
+
+// Simple keyword-based answer finder
+function getKnectAnswer(query) {
+  const q = query.toLowerCase();
+  let best = null;
+  let score = 0;
+
+  for (const item of knectQA) {
+    let s = item.keywords.reduce((acc, kw) => acc + (q.includes(kw) ? 1 : 0), 0);
+    if (s > score) {
+      score = s;
+      best = item;
+    }
+  }
+
+  if (best && score > 0) {
+    return best.answer;
+  }
+  return "Hmm, that doesn’t seem related to what I can help with. Try asking something about KnectHotel";
+}
+
 
 // Public chat endpoint for widget (uses API key)
 app.post("/api/chat/public", authenticateApiKey, async (req, res) => {
   try {
     const { message } = req.body;
     if (!message) return res.status(400).json({ error: "Message is required" });
-    if (!apiKey) return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
 
-    // Use user context if API key is valid, otherwise use default
-    let contextToUse = defaultDomainContext;
-    if (req.user && req.user.contextData) {
-      contextToUse = req.user.contextData;
-    } else if (!req.user) {
-      return res.status(401).json({ error: "Invalid API key" });
+    // If this is KnectHotel’s Gmail account, skip Gemini and use local Q&A
+    if (req.user && req.user.email === "knect_hotel@gmail.com") {
+      const reply = getKnectAnswer(message);
+      return res.json({ reply });
     }
 
-    const prompt = `You are QueryMate, a helpful assistant. Use ONLY the following context to answer. If the answer isn't in the context, say "Hmm, that doesn’t seem related to what I can help with. Want to try a different question?"\n\nContext:\n${contextToUse}\n\nUser question:\n${message}`;
+    // Fallback: use Gemini for all other users
+    if (!apiKey) return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
 
-    // Try models in order: gemini-2.0-flash-exp, gemini-1.5-flash, gemini-pro
+    let contextToUse = defaultDomainContext;
+    if (req.user && req.user.contextData) contextToUse = req.user.contextData;
+
+    const prompt = `You are QueryMate, a helpful assistant. Use ONLY the following context to answer. If the answer isn't in the context, say "Hmm, that doesn’t seem related to what I can help with."\n\nContext:\n${contextToUse}\n\nUser question:\n${message}`;
+
     const modelsToTry = ["gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-pro"];
     let lastError = null;
 
@@ -758,11 +791,9 @@ app.post("/api/chat/public", authenticateApiKey, async (req, res) => {
       } catch (err) {
         lastError = err;
         console.log(`Model ${modelName} failed, trying next...`);
-        continue;
       }
     }
 
-    // If all models failed, return error
     throw lastError || new Error("All models failed");
   } catch (err) {
     console.error("ERROR in /api/chat/public:", err);
@@ -770,22 +801,26 @@ app.post("/api/chat/public", authenticateApiKey, async (req, res) => {
   }
 });
 
+
 // Chat route with user context support (for authenticated users)
 app.post("/api/chat", authenticateToken, async (req, res) => {
   try {
     const { message } = req.body;
     if (!message) return res.status(400).json({ error: "Message is required" });
-    if (!apiKey) return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
 
-    // Use user context if logged in, otherwise use default
-    let contextToUse = defaultDomainContext;
-    if (req.user && req.user.contextData) {
-      contextToUse = req.user.contextData;
+    // Use JSON logic if the account is KnectHotel
+    if (req.user && req.user.email === "knect_hotel@gmail.com") {
+      const reply = getKnectAnswer(message);
+      return res.json({ reply });
     }
 
-    const prompt = `You are QueryMate, a helpful assistant. Use ONLY the following context to answer. If the answer isn't in the context, say "I am here to discuss the information you've provided. Could you tell me more about what you're looking for?"\n\nContext:\n${contextToUse}\n\nUser question:\n${message}`;
+    if (!apiKey) return res.status(500).json({ error: "Server missing GEMINI_API_KEY" });
 
-    // Try models in order: gemini-2.0-flash-exp, gemini-1.5-flash, gemini-pro
+    let contextToUse = defaultDomainContext;
+    if (req.user && req.user.contextData) contextToUse = req.user.contextData;
+
+    const prompt = `You are QueryMate, a helpful assistant. Use ONLY the following context to answer.\n\nContext:\n${contextToUse}\n\nUser question:\n${message}`;
+
     const modelsToTry = ["gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-pro"];
     let lastError = null;
 
@@ -799,17 +834,16 @@ app.post("/api/chat", authenticateToken, async (req, res) => {
       } catch (err) {
         lastError = err;
         console.log(`Model ${modelName} failed, trying next...`);
-        continue;
       }
     }
 
-    // If all models failed, return error
     throw lastError || new Error("All models failed");
   } catch (err) {
     console.error("ERROR in /api/chat:", err);
-    res.json({ reply: `Note: live AI unavailable. (Details: ${err.message})` });
+    res.json({ reply: `Note: AI unavailable. (${err.message})` });
   }
 });
+
 
 // Use PORT from environment (for Render.com) or default to 5000
 const PORT = process.env.PORT || 5000;
