@@ -22,7 +22,7 @@ const allowedOrigins = [
 // CORS for regular endpoints
 app.use((req, res, next) => {
   // Allow all origins for public chat endpoint (widget embedding)
-  if (req.path === "/api/chat/public" || req.path === "/widget.js") {
+  if (req.path === "/api/chat/public" || req.path === "/api/widget-settings" || req.path === "/widget.js") {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.header("Access-Control-Allow-Headers", "Content-Type, X-API-Key");
@@ -60,6 +60,14 @@ const userSchema = new mongoose.Schema({
   password: { type: String, required: true },
   contextData: { type: String, default: "" }, // User-specific context for chatbot
   apiKey: { type: String, unique: true, sparse: true }, // API key for widget embedding
+  widgetSettings: {
+    widgetColor: { type: String, default: "#667eea" }, // Widget button color
+    logoColor: { type: String, default: "#ffffff" }, // Logo/icon color
+    chatWindowColor: { type: String, default: "#ffffff" }, // Chat window background
+    headerColor: { type: String, default: "#667eea" }, // Header background color
+    headerText: { type: String, default: "QueryMate" }, // Header text (editable)
+    poweredByText: { type: String, default: "Powered by QueryMate" } // Powered by text (not editable)
+  },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -226,6 +234,134 @@ app.get("/api/user/api-key", authenticateToken, async (req, res) => {
     res.json({ apiKey: user.apiKey || null });
   } catch (err) {
     console.error("Get API key error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get widget settings (public endpoint for widget)
+app.get("/api/widget-settings", authenticateApiKey, async (req, res) => {
+  try {
+    if (!req.user) {
+      // Return default settings if no user found
+      return res.json({ 
+        widgetSettings: {
+          widgetColor: "#667eea",
+          logoColor: "#ffffff",
+          chatWindowColor: "#ffffff",
+          headerColor: "#667eea",
+          headerText: "QueryMate",
+          poweredByText: "Powered by QueryMate"
+        }
+      });
+    }
+
+    const user = await User.findById(req.user._id).select("widgetSettings");
+    res.json({ 
+      widgetSettings: user.widgetSettings || {
+        widgetColor: "#667eea",
+        logoColor: "#ffffff",
+        chatWindowColor: "#ffffff",
+        headerColor: "#667eea",
+        headerText: "QueryMate",
+        poweredByText: "Powered by QueryMate"
+      }
+    });
+  } catch (err) {
+    console.error("Get widget settings error:", err);
+    // Return default settings on error
+    res.json({ 
+      widgetSettings: {
+        widgetColor: "#667eea",
+        logoColor: "#ffffff",
+        chatWindowColor: "#ffffff",
+        headerColor: "#667eea",
+        headerText: "QueryMate",
+        poweredByText: "Powered by QueryMate"
+      }
+    });
+  }
+});
+
+// Get widget settings (authenticated endpoint for frontend)
+app.get("/api/user/widget-settings", authenticateToken, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    // Get user ID - handle both _id and id
+    const userId = req.user._id || req.user.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Invalid user" });
+    }
+
+    const user = await User.findById(userId).select("widgetSettings");
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json({ 
+      widgetSettings: user.widgetSettings || {
+        widgetColor: "#667eea",
+        logoColor: "#ffffff",
+        chatWindowColor: "#ffffff",
+        headerColor: "#667eea",
+        headerText: "QueryMate",
+        poweredByText: "Powered by QueryMate"
+      }
+    });
+  } catch (err) {
+    console.error("Get widget settings error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update widget settings
+app.put("/api/user/widget-settings", authenticateToken, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    // Get user ID - handle both _id and id
+    const userId = req.user._id || req.user.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Invalid user" });
+    }
+
+    const { widgetSettings } = req.body;
+    if (!widgetSettings) {
+      return res.status(400).json({ error: "Widget settings are required" });
+    }
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    // Initialize widgetSettings if it doesn't exist
+    if (!user.widgetSettings) {
+      user.widgetSettings = {};
+    }
+    
+    // Update widget settings, preserving defaults if not provided
+    user.widgetSettings = {
+      widgetColor: widgetSettings.widgetColor || user.widgetSettings?.widgetColor || "#667eea",
+      logoColor: widgetSettings.logoColor || user.widgetSettings?.logoColor || "#ffffff",
+      chatWindowColor: widgetSettings.chatWindowColor || user.widgetSettings?.chatWindowColor || "#ffffff",
+      headerColor: widgetSettings.headerColor || user.widgetSettings?.headerColor || "#667eea",
+      headerText: widgetSettings.headerText || user.widgetSettings?.headerText || "QueryMate",
+      poweredByText: user.widgetSettings?.poweredByText || "Powered by QueryMate" // Not editable
+    };
+    
+    await user.save();
+
+    res.json({ 
+      message: "Widget settings updated successfully",
+      widgetSettings: user.widgetSettings
+    });
+  } catch (err) {
+    console.error("Update widget settings error:", err);
     res.status(500).json({ error: err.message });
   }
 });
