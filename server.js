@@ -63,6 +63,10 @@ const userSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+// Add indexes for faster queries
+userSchema.index({ email: 1 });
+userSchema.index({ apiKey: 1 });
+
 const User = mongoose.model("User", userSchema);
 
 // ContextSession Schema
@@ -72,6 +76,9 @@ const contextSessionSchema = new mongoose.Schema({
   stage: { type: String, enum: ["collecting", "complete"], default: "collecting" },
   lastUpdated: { type: Date, default: Date.now }
 });
+
+// Add index for faster queries
+contextSessionSchema.index({ email: 1 });
 
 const ContextSession = mongoose.model("ContextSession", contextSessionSchema);
 
@@ -89,7 +96,8 @@ const authenticateToken = async (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = await User.findById(decoded.userId).select("-password");
+    // Only select needed fields for better performance (excluding password)
+    req.user = await User.findById(decoded.userId).select("email contextData apiKey");
     next();
   } catch (err) {
     next(); // Continue without user if token invalid
@@ -260,91 +268,8 @@ app.get("/api/context-session", authenticateToken, async (req, res) => {
       });
       await session.save();
       
-      // Get initial greeting from Gemini
-      const geminiApiKey = process.env.GEMINI_API_KEY;
-      if (geminiApiKey) {
-        try {
-          const tempGenAI = new GoogleGenerativeAI(geminiApiKey);
-          const prompt = `You are QueryMate, an intelligent assistant that gathers detailed context information about a business or service.
-
-Your task is to ask smart, natural questions until you have enough information to generate a complete description.
-
-Use what you already know to decide the next question — do not ask irrelevant or repetitive things.
-
-Always collect details such as:
-- What the business or service offers
-- Target users or customers
-- Core features or benefits
-- Pricing or availability details
-- Contact or support information
-- Any additional unique qualities
-
-Once you have enough context, mark the process as complete.
-
-Respond in JSON format only:
-
-{
-  "reply": "<your next conversational question or confirmation>",
-  "collectedData": {
-    "business_name": "...",
-    "description": "...",
-    "target_audience": "...",
-    "features": "...",
-    "pricing": "...",
-    "support": "...",
-    "contact": "...",
-    "...": "add dynamically as discovered"
-  },
-  "done": true or false
-}
-
-Current collected data:
-{}
-
-Latest user message:
-"[Initial greeting - start the conversation]"`;
-
-          const modelsToTry = ["gemini-1.5-pro", "gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-pro"];
-          for (const modelName of modelsToTry) {
-            try {
-              const model = tempGenAI.getGenerativeModel({ model: modelName });
-              const result = await model.generateContent(prompt);
-              const response = await result.response;
-              const text = response.text();
-              
-              let jsonText = text.trim();
-              if (jsonText.startsWith("```")) {
-                jsonText = jsonText.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-              }
-              
-              const geminiResponse = JSON.parse(jsonText);
-              if (geminiResponse.collectedData) {
-                session.collectedData = { ...session.collectedData, ...geminiResponse.collectedData };
-              }
-              if (geminiResponse.done === true) {
-                session.stage = "complete";
-              }
-              session.lastUpdated = new Date();
-              await session.save();
-              
-              return res.json({
-                session: {
-                  collectedData: session.collectedData,
-                  stage: session.stage,
-                  lastUpdated: session.lastUpdated
-                },
-                initialMessage: geminiResponse.reply || "Hello! I'm QueryMate. Let's gather some information about your business or service. What does your business do?"
-              });
-            } catch (err) {
-              continue;
-            }
-          }
-        } catch (err) {
-          console.error("Error getting initial greeting:", err);
-        }
-      }
-      
-      // Fallback if Gemini fails
+      // Return immediately with a simple greeting - don't call Gemini API here
+      // This makes the page load instantly. Gemini will be called when user sends first message.
       return res.json({
         session: {
           collectedData: session.collectedData,
@@ -355,14 +280,29 @@ Latest user message:
       });
     }
 
-    // If session exists but is complete, return it
+    // If session exists, return it immediately
     if (session) {
+      // If session is complete, return it
+      if (session.stage === "complete") {
+        return res.json({
+          session: {
+            collectedData: session.collectedData,
+            stage: session.stage,
+            lastUpdated: session.lastUpdated
+          }
+        });
+      }
+      
+      // If session is still collecting, return with a simple message if no messages yet
       return res.json({
         session: {
           collectedData: session.collectedData,
           stage: session.stage,
           lastUpdated: session.lastUpdated
-        }
+        },
+        initialMessage: Object.keys(session.collectedData).length === 0 
+          ? "Hello! I'm QueryMate. Let's gather some information about your business or service. What does your business do?"
+          : "Let's continue gathering information about your business. What would you like to tell me?"
       });
     }
 
@@ -451,18 +391,31 @@ ${JSON.stringify(session.collectedData, null, 2)}
 Latest user message:
 "${message}"`;
 
-    // Call Gemini API
+    // Call Gemini API with timeout
     const tempGenAI = new GoogleGenerativeAI(geminiApiKey);
-    const modelsToTry = ["gemini-1.5-pro", "gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-pro"];
+    // Prioritize faster models first
+    const modelsToTry = ["gemini-2.0-flash-exp", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"];
     let lastError = null;
     let geminiResponse = null;
+
+    // Helper function to add timeout to Gemini calls
+    const callGeminiWithTimeout = async (model, prompt, timeoutMs = 20000) => {
+      return Promise.race([
+        (async () => {
+          const result = await model.generateContent(prompt);
+          const response = await result.response;
+          return response.text();
+        })(),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error("Gemini API timeout")), timeoutMs)
+        )
+      ]);
+    };
 
     for (const modelName of modelsToTry) {
       try {
         const model = tempGenAI.getGenerativeModel({ model: modelName });
-        const result = await model.generateContent(prompt);
-        const response = await result.response;
-        const text = response.text();
+        const text = await callGeminiWithTimeout(model, prompt, 20000);
         
         // Try to parse JSON from response
         // Sometimes Gemini wraps JSON in markdown code blocks
@@ -475,7 +428,7 @@ Latest user message:
         break;
       } catch (err) {
         lastError = err;
-        console.log(`Model ${modelName} failed, trying next...`);
+        console.log(`Model ${modelName} failed: ${err.message}, trying next...`);
         continue;
       }
     }
@@ -573,6 +526,25 @@ app.post("/api/context-session/complete", authenticateToken, async (req, res) =>
     });
   } catch (err) {
     console.error("Complete context session error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete/Reset context session
+app.delete("/api/context-session", authenticateToken, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    // Delete the session
+    await ContextSession.findOneAndDelete({ email: req.user.email });
+
+    res.json({ 
+      message: "Context session reset successfully"
+    });
+  } catch (err) {
+    console.error("Delete context session error:", err);
     res.status(500).json({ error: err.message });
   }
 });
