@@ -112,6 +112,25 @@ const authenticateToken = async (req, res, next) => {
   }
 };
 
+// Middleware to authenticate by API key
+const authenticateApiKey = async (req, res, next) => {
+  const userApiKey = req.headers["x-api-key"] || req.body.apiKey;
+  
+  if (!userApiKey) {
+    return next(); // Continue without user if no API key
+  }
+
+  try {
+    const user = await User.findOne({ apiKey: userApiKey }).select("-password");
+    if (user) {
+      req.user = user;
+    }
+    next();
+  } catch (err) {
+    next(); // Continue without user if error
+  }
+};
+
 app.get("/", (req, res) => {
   res.send("Backend is running ✅");
 });
@@ -707,24 +726,6 @@ try {
   console.warn("⚠️ Failed to load domain data:", e.message);
 }
 
-// Middleware to authenticate by API key
-const authenticateApiKey = async (req, res, next) => {
-  const userApiKey = req.headers["x-api-key"] || req.body.apiKey;
-  
-  if (!userApiKey) {
-    return next(); // Continue without user if no API key
-  }
-
-  try {
-    const user = await User.findOne({ apiKey: userApiKey }).select("-password");
-    if (user) {
-      req.user = user;
-    }
-    next();
-  } catch (err) {
-    next(); // Continue without user if error
-  }
-};
 
 // Public chat endpoint for widget (uses API key)
 app.post("/api/chat/public", authenticateApiKey, async (req, res) => {
