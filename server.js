@@ -728,7 +728,8 @@ let knectQA = [];
 
 try {
   if (fs.existsSync(knectQAPath)) {
-    knectQA = JSON.parse(fs.readFileSync(knectQAPath, "utf-8"));
+    const fileContent = fs.readFileSync(knectQAPath, "utf-8");
+    knectQA = JSON.parse(fileContent);
     console.log(`✅ Loaded ${knectQA.length} KnectHotel Q&A entries`);
   } else {
     console.warn(`⚠️ Missing ${knectQAPath}`);
@@ -737,25 +738,35 @@ try {
   console.error("❌ Failed to load knect_data.json:", err);
 }
 
-// Simple keyword-based answer finder
 function getKnectAnswer(query) {
-  const q = query.toLowerCase();
-  let best = null;
-  let score = 0;
+  if (!Array.isArray(knectQA) || knectQA.length === 0) {
+    return "KnectHotel data not found or empty.";
+  }
+
+  const q = query.toLowerCase().trim();
+  let bestMatch = null;
+  let highestScore = 0;
 
   for (const item of knectQA) {
-    let s = item.keywords.reduce((acc, kw) => acc + (q.includes(kw) ? 1 : 0), 0);
-    if (s > score) {
-      score = s;
-      best = item;
+    let score = 0;
+    for (const kw of item.keywords) {
+      if (q.includes(kw.toLowerCase())) score++;
+    }
+
+    if (score > highestScore) {
+      highestScore = score;
+      bestMatch = item;
     }
   }
 
-  if (best && score > 0) {
-    return best.answer;
+  if (bestMatch && highestScore > 0) {
+    return bestMatch.answer;
   }
-  return "Hmm, that doesn’t seem related to what I can help with. Try asking something about KnectHotel";
+
+  return "Hmm, that doesn’t seem related to what I can help with. Try asking something about KnectHotel.";
 }
+
+
 
 
 // Public chat endpoint for widget (uses API key)
