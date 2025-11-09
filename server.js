@@ -366,7 +366,6 @@ app.put("/api/user/widget-settings", authenticateToken, async (req, res) => {
       chatWindowColor: widgetSettings.chatWindowColor || user.widgetSettings?.chatWindowColor || "#ffffff",
       headerColor: widgetSettings.headerColor || user.widgetSettings?.headerColor || "#667eea",
       headerText: widgetSettings.headerText || user.widgetSettings?.headerText || "QueryMate",
-      poweredByText: user.widgetSettings?.poweredByText || "Powered by QueryMate" // Not editable
     };
     
     await user.save();
